@@ -160,6 +160,7 @@ class EGNN(nn.Module):
         norm_coors_scale_init = 1e-2,
         update_feats = True,
         update_coors = True,
+        update_vel = False,
         only_sparse_neighbors = False,
         valid_radius = float('inf'),
         m_pool_method = 'sum',
@@ -207,6 +208,13 @@ class EGNN(nn.Module):
             nn.Linear(m_dim * 4, 1)
         ) if update_coors else None
 
+        self.vel_mlp = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            dropout,
+            SiLU(),
+            nn.Linear(dim * 4, 1)
+        ) if update_vel else None
+
         self.num_nearest_neighbors = num_nearest_neighbors
         self.only_sparse_neighbors = only_sparse_neighbors
         self.valid_radius = valid_radius
@@ -221,7 +229,7 @@ class EGNN(nn.Module):
             # seems to be needed to keep the network from exploding to NaN with greater depths
             nn.init.normal_(module.weight, std = self.init_eps)
 
-    def forward(self, feats, coors, edges = None, mask = None, adj_mat = None):
+    def forward(self, feats, coors, edges = None, mask = None, adj_mat = None, vel = None):
         b, n, d, device, fourier_features, num_nearest, valid_radius, only_sparse_neighbors = *feats.shape, feats.device, self.fourier_features, self.num_nearest_neighbors, self.valid_radius, self.only_sparse_neighbors
 
         if exists(mask):
@@ -312,9 +320,18 @@ class EGNN(nn.Module):
                 clamp_value = self.coor_weights_clamp_value
                 coor_weights.clamp_(min = -clamp_value, max = clamp_value)
 
-            coors_out = einsum('b i j, b i j c -> b i c', coor_weights, rel_coors) + coors
+            if exists(self.vel_mlp):
+                vel_weights = self.vel_mlp(feats)
+                vel_weights = rearrange(vel_weights, 'b i () -> b i')
+                vel_out = (einsum('b i , b i d', vel_weights, vel)
+                           + einsum('b i j, b i j c -> b i c', coor_weights, rel_coors))
+                coors_out = vel_out + coors
+            else:
+                coors_out = einsum('b i j, b i j c -> b i c', coor_weights, rel_coors) + coors
+                vel_out = vel
         else:
             coors_out = coors
+            vel_out = vel
 
         if exists(self.node_mlp):
             if exists(mask):
@@ -338,7 +355,7 @@ class EGNN(nn.Module):
         else:
             node_out = feats
 
-        return node_out, coors_out
+        return node_out, coors_out, vel_out
 
 class EGNN_Network(nn.Module):
     def __init__(
